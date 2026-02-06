@@ -18,7 +18,7 @@ except ImportError:
     print("Для установки: pip install jax jaxlib")
 
 # ======================================================================================
-# НАСТРОЙКИ ВАРИАНТА
+# НАСТРОЙКИ ВАРИАНТА И КОНСТАНТЫ
 # ======================================================================================
 
 N = 30      # Длина выборки
@@ -32,27 +32,56 @@ TRUE_THETA = np.array([0.8, 0.5])
 def get_input_signal(k):
     return np.array([1.0])
 
+# --- ГЛОБАЛЬНЫЕ КОНСТАНТНЫЕ МАТРИЦЫ (Определены один раз через Numpy) ---
+# Если эти матрицы не зависят от theta, их нет смысла пересоздавать внутри функций
+CONST_GAMMA = np.eye(n)
+CONST_H     = np.array([[1.0, 0.0]])
+CONST_Q     = np.eye(p) * 0.1
+CONST_R     = np.eye(m) * 0.1
+CONST_X0    = np.zeros(n)
+CONST_P0    = np.eye(n) * 1.0
+
 # ======================================================================================
-# ФУНКЦИИ ФОРМИРОВАНИЯ МАТРИЦ (NUMPY - ДЛЯ РУЧНОГО ГРАДИЕНТА)
+# УНИВЕРСАЛЬНЫЙ СТРОИТЕЛЬ МАТРИЦ (Back-end Agnostic)
+# ======================================================================================
+
+def build_parametric_matrices(theta, xp):
+    """
+    Строит матрицы, зависящие от параметров theta.
+    xp - это библиотека (numpy или jax.numpy), которая будет использоваться для создания массивов.
+    Это позволяет описать структуру матриц F и Psi ТОЛЬКО ОДИН РАЗ.
+    """
+    th1, th2 = theta[0], theta[1]
+    
+    # Используем xp.array вместо np.array или jnp.array
+    F = xp.array([
+        [th1, 0.0], 
+        [0.0, 0.9]
+    ])
+    
+    Psi = xp.array([
+        [th2], 
+        [1.0]
+    ])
+    
+    return F, Psi
+
+# ======================================================================================
+# ФУНКЦИИ ФОРМИРОВАНИЯ ПОЛНОГО НАБОРА (ОБЕРТКИ)
 # ======================================================================================
 
 def get_system_matrices(theta):
-    """Версия для ручного градиента (использует numpy)"""
-    th1, th2 = theta[0], theta[1]
+    """Версия для ручного градиента (возвращает стандартные numpy массивы)"""
+    # 1. Строим динамические матрицы используя numpy
+    F, Psi = build_parametric_matrices(theta, np)
     
-    F = np.array([[th1, 0.0], [0.0, 0.9]])
-    Psi = np.array([[th2], [1.0]])
-    Gamma = np.eye(n)
-    H = np.array([[1.0, 0.0]])
-    Q = np.eye(p) * 0.1
-    R = np.eye(m) * 0.1
-    x0_mean = np.zeros(n)
-    P0 = np.eye(n) * 1.0
-    
-    return F, Psi, Gamma, H, Q, R, x0_mean, P0
+    # 2. Возвращаем вместе с глобальными константами
+    return F, Psi, CONST_GAMMA, CONST_H, CONST_Q, CONST_R, CONST_X0, CONST_P0
 
 def get_matrix_derivatives(theta):
     """Аналитические производные матриц (для I уровня сложности)"""
+    # Эту функцию сложно унифицировать, так как производные зависят от структуры,
+    # но она используется только в "ручном" методе.
     s = len(theta)
     dF = [np.zeros((n, n)) for _ in range(s)]
     dPsi = [np.zeros((n, r)) for _ in range(s)]
@@ -72,27 +101,29 @@ def get_matrix_derivatives(theta):
     return dF, dPsi, dGamma, dH, dQ, dR, dx0, dP0
 
 # ======================================================================================
-# ФУНКЦИИ ФОРМИРОВАНИЯ МАТРИЦ (JAX - ДЛЯ АВТО-ДИФФЕРЕНЦИРОВАНИЯ)
+# ФУНКЦИИ ДЛЯ JAX (АВТО-ДИФФЕРЕНЦИРОВАНИЕ)
 # ======================================================================================
 
 if JAX_AVAILABLE:
     def get_system_matrices_jax(theta):
         """
-        То же самое, что get_system_matrices, но используем jnp.array.
-        JAX должен видеть математику, чтобы взять производную.
+        Версия для JAX.
+        Использует jnp для динамических матриц и конвертирует константы.
         """
-        th1, th2 = theta[0], theta[1]
+        # 1. Строим динамические матрицы используя jax.numpy (jnp)
+        # Важно: theta здесь - это JAX Tracer, поэтому нельзя использовать обычный numpy
+        F, Psi = build_parametric_matrices(theta, jnp)
         
-        F = jnp.array([[th1, 0.0], [0.0, 0.9]])
-        Psi = jnp.array([[th2], [1.0]])
-        Gamma = jnp.eye(n)
-        H = jnp.array([[1.0, 0.0]])
-        Q = jnp.eye(p) * 0.1
-        R = jnp.eye(m) * 0.1
-        x0_mean = jnp.zeros(n)
-        P0 = jnp.eye(n) * 1.0
+        # 2. Конвертируем глобальные numpy-константы в jax-массивы
+        # jnp.array() эффективно переносит данные (или создает view)
+        Gamma = jnp.array(CONST_GAMMA)
+        H     = jnp.array(CONST_H)
+        Q     = jnp.array(CONST_Q)
+        R     = jnp.array(CONST_R)
+        x0    = jnp.array(CONST_X0)
+        P0    = jnp.array(CONST_P0)
         
-        return F, Psi, Gamma, H, Q, R, x0_mean, P0
+        return F, Psi, Gamma, H, Q, R, x0, P0
 
     def calculate_loss_jax(theta, Y_observations_jax, U_inputs_jax):
         """
@@ -101,50 +132,33 @@ if JAX_AVAILABLE:
         """
         F, Psi, Gamma, H, Q, R, x0, P0 = get_system_matrices_jax(theta)
         
-        # JAX требует аккуратности с циклами, но для gradient check 
-        # простой python loop допустим, если массивы не изменяются in-place.
-        
         x_pred = x0
         P_pred = P0
         x_filt = x0
         P_filt = P0
         
         J = 0.0
-        # Константа
         J += 0.5 * N * m * jnp.log(2 * jnp.pi)
         
-        # Проходим по всем измерениям
-        # Примечание: В JAX лучше использовать jax.lax.scan для скорости, 
-        # но для проверки градиента обычный цикл понятнее.
+        # Основной цикл фильтра (JAX-совместимый)
         for k in range(N):
             u = U_inputs_jax[k]
             y_obs = Y_observations_jax[k]
             
-            # 1. Прогноз (если k > 0)
-            # В Python `if` внутри JIT может быть проблемой, но здесь мы не используем @jit
-            # для внешней функции, так что Python control flow сработает.
             if k > 0:
                  x_pred = F @ x_filt + Psi @ u
                  P_pred = F @ P_filt @ F.T + Gamma @ Q @ Gamma.T
             else:
-                 # Для k=0 x_pred = x0 (уже задано)
                  pass
 
-            # 2. Инновация
             epsilon = y_obs - H @ x_pred
             B = H @ P_pred @ H.T + R
             
-            # 3. Накопление критерия
-            # slogdet возвращает (sign, logdet), нам нужен logdet
             _, log_det_B = jnp.linalg.slogdet(B)
-            
-            # eps.T * B^-1 * eps
-            # jnp.linalg.solve(a, b) решает ax = b -> x = a^-1 b
             term_quad = epsilon.T @ jnp.linalg.solve(B, epsilon)
             
             J += 0.5 * (log_det_B + term_quad)
             
-            # 4. Обновление (Фильтрация)
             K = P_pred @ H.T @ jnp.linalg.inv(B)
             x_filt = x_pred + K @ epsilon
             P_filt = (jnp.eye(n) - K @ H) @ P_pred
@@ -159,7 +173,7 @@ def generate_data(theta_true, N_samples):
     F, Psi, Gamma, H, Q, R, x0, P0 = get_system_matrices(theta_true)
     x = np.random.multivariate_normal(x0, P0)
     Y_obs = []
-    U_inputs = [] # Сохраняем входы для чистоты эксперимента
+    U_inputs = [] 
     
     for k in range(N_samples):
         u = get_input_signal(k)
@@ -273,7 +287,6 @@ def verify_gradients(Y_obs, U_inputs):
 
     print("\n=== ПРОВЕРКА ГРАДИЕНТОВ (JAX vs ANALYTICAL) ===")
     
-    # Точка проверки (случайная или истинная)
     theta_test = TRUE_THETA + 0.1
     print(f"Точка проверки theta: {theta_test}")
     
@@ -281,17 +294,12 @@ def verify_gradients(Y_obs, U_inputs):
     J_manual, grad_manual = log_likelihood_and_gradient(theta_test, Y_obs)
     
     # 2. Автоматический расчет через JAX
-    # Преобразуем данные в JAX массивы
     Y_jax = jnp.array(Y_obs)
     U_jax = jnp.array(U_inputs)
     
-    # Создаем функцию, которая возвращает значение и градиент
     value_and_grad_fn = jax.value_and_grad(calculate_loss_jax)
-    
-    # Вычисляем
     J_auto, grad_auto = value_and_grad_fn(jnp.array(theta_test), Y_jax, U_jax)
     
-    # Преобразуем обратно в numpy для вывода
     J_auto = float(J_auto)
     grad_auto = np.array(grad_auto)
     
