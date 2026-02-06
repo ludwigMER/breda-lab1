@@ -14,7 +14,7 @@ try:
     JAX_AVAILABLE = True
 except ImportError:
     JAX_AVAILABLE = False
-    print("ВНИМАНИЕ: Библиотека JAX не найдена. Сравнение с авто-дифференцированием будет пропущено.")
+    print("ВНИМАНИЕ: Библиотека JAX не найдена. Работаем в ручном режиме.")
     print("Для установки: pip install jax jaxlib")
 
 # ======================================================================================
@@ -28,12 +28,12 @@ r = 1       # Размерность u
 p = 2       # Размерность w
 
 TRUE_THETA = np.array([0.8, 0.5]) 
+USE_JAX_OPTIMIZER = True # Переключатель: True - используем JAX для поиска, False - ручной градиент
 
 def get_input_signal(k):
     return np.array([1.0])
 
-# --- ГЛОБАЛЬНЫЕ КОНСТАНТНЫЕ МАТРИЦЫ (Определены один раз через Numpy) ---
-# Если эти матрицы не зависят от theta, их нет смысла пересоздавать внутри функций
+# --- ГЛОБАЛЬНЫЕ КОНСТАНТНЫЕ МАТРИЦЫ ---
 CONST_GAMMA = np.eye(n)
 CONST_H     = np.array([[1.0, 0.0]])
 CONST_Q     = np.eye(p) * 0.1
@@ -47,13 +47,10 @@ CONST_P0    = np.eye(n) * 1.0
 
 def build_parametric_matrices(theta, xp):
     """
-    Строит матрицы, зависящие от параметров theta.
-    xp - это библиотека (numpy или jax.numpy), которая будет использоваться для создания массивов.
-    Это позволяет описать структуру матриц F и Psi ТОЛЬКО ОДИН РАЗ.
+    xp - это библиотека (numpy или jax.numpy).
     """
     th1, th2 = theta[0], theta[1]
     
-    # Используем xp.array вместо np.array или jnp.array
     F = xp.array([
         [th1, 0.0], 
         [0.0, 0.9]
@@ -72,16 +69,11 @@ def build_parametric_matrices(theta, xp):
 
 def get_system_matrices(theta):
     """Версия для ручного градиента (возвращает стандартные numpy массивы)"""
-    # 1. Строим динамические матрицы используя numpy
     F, Psi = build_parametric_matrices(theta, np)
-    
-    # 2. Возвращаем вместе с глобальными константами
     return F, Psi, CONST_GAMMA, CONST_H, CONST_Q, CONST_R, CONST_X0, CONST_P0
 
 def get_matrix_derivatives(theta):
     """Аналитические производные матриц (для I уровня сложности)"""
-    # Эту функцию сложно унифицировать, так как производные зависят от структуры,
-    # но она используется только в "ручном" методе.
     s = len(theta)
     dF = [np.zeros((n, n)) for _ in range(s)]
     dPsi = [np.zeros((n, r)) for _ in range(s)]
@@ -106,41 +98,30 @@ def get_matrix_derivatives(theta):
 
 if JAX_AVAILABLE:
     def get_system_matrices_jax(theta):
-        """
-        Версия для JAX.
-        Использует jnp для динамических матриц и конвертирует константы.
-        """
-        # 1. Строим динамические матрицы используя jax.numpy (jnp)
-        # Важно: theta здесь - это JAX Tracer, поэтому нельзя использовать обычный numpy
+        """Версия для JAX."""
         F, Psi = build_parametric_matrices(theta, jnp)
         
-        # 2. Конвертируем глобальные numpy-константы в jax-массивы
-        # jnp.array() эффективно переносит данные (или создает view)
         Gamma = jnp.array(CONST_GAMMA)
         H     = jnp.array(CONST_H)
         Q     = jnp.array(CONST_Q)
         R     = jnp.array(CONST_R)
         x0    = jnp.array(CONST_X0)
         P0    = jnp.array(CONST_P0)
-        
         return F, Psi, Gamma, H, Q, R, x0, P0
 
     def calculate_loss_jax(theta, Y_observations_jax, U_inputs_jax):
         """
         Чистая функция расчета критерия J (без ручного градиента).
-        JAX автоматически построит граф вычислений для этой функции.
+        JAX автоматически строит граф вычислений для этой функции.
         """
         F, Psi, Gamma, H, Q, R, x0, P0 = get_system_matrices_jax(theta)
         
-        x_pred = x0
-        P_pred = P0
-        x_filt = x0
-        P_filt = P0
+        x_pred = x0; P_pred = P0
+        x_filt = x0; P_filt = P0
         
         J = 0.0
         J += 0.5 * N * m * jnp.log(2 * jnp.pi)
         
-        # Основной цикл фильтра (JAX-совместимый)
         for k in range(N):
             u = U_inputs_jax[k]
             y_obs = Y_observations_jax[k]
@@ -148,8 +129,6 @@ if JAX_AVAILABLE:
             if k > 0:
                  x_pred = F @ x_filt + Psi @ u
                  P_pred = F @ P_filt @ F.T + Gamma @ Q @ Gamma.T
-            else:
-                 pass
 
             epsilon = y_obs - H @ x_pred
             B = H @ P_pred @ H.T + R
@@ -165,6 +144,32 @@ if JAX_AVAILABLE:
             
         return J
 
+    def create_jax_optimization_wrapper(Y_obs_numpy, U_inputs_numpy):
+        """
+        Создает функцию-обертку для scipy.minimize.
+        1. Компилирует (JIT) функцию value_and_grad.
+        2. Замораживает данные (Y и U) внутри замыкания.
+        3. Конвертирует типы данных между Numpy (scipy) и JAX.
+        """
+        # Преобразуем данные в JAX массивы один раз
+        Y_jax = jnp.array(Y_obs_numpy)
+        U_jax = jnp.array(U_inputs_numpy)
+        
+        # Создаем функцию, которая возвращает значение И градиент
+        # jit ускоряет выполнение в десятки раз
+        jax_val_and_grad = jax.jit(jax.value_and_grad(calculate_loss_jax))
+        
+        def objective_function(theta_numpy):
+            # theta приходит из scipy как numpy array
+            
+            # Вычисляем через JAX
+            val, grad = jax_val_and_grad(theta_numpy, Y_jax, U_jax)
+            
+            # Конвертируем обратно в стандартные python/numpy типы для scipy
+            return float(val), np.array(grad)
+            
+        return objective_function
+
 # ======================================================================================
 # ОСНОВНАЯ ЛОГИКА (РУЧНОЙ МЕТОД)
 # ======================================================================================
@@ -172,8 +177,7 @@ if JAX_AVAILABLE:
 def generate_data(theta_true, N_samples):
     F, Psi, Gamma, H, Q, R, x0, P0 = get_system_matrices(theta_true)
     x = np.random.multivariate_normal(x0, P0)
-    Y_obs = []
-    U_inputs = [] 
+    Y_obs = []; U_inputs = [] 
     
     for k in range(N_samples):
         u = get_input_signal(k)
@@ -208,8 +212,11 @@ def log_likelihood_and_gradient(theta, Y_observations):
     grad_J = np.zeros(s)
     J += 0.5 * N * m * np.log(2 * np.pi)
     
+    # Для ручного метода нам нужен массив входов U, восстановим его через функцию
+    U_inputs = [get_input_signal(k) for k in range(N)]
+    
     for k in range(N):
-        u = get_input_signal(k)
+        u = U_inputs[k]
         y_obs = Y_observations[k]
         
         if k > 0:
@@ -279,29 +286,17 @@ def predict_output(theta, Y_obs):
     return np.array(Y_hat)
 
 def verify_gradients(Y_obs, U_inputs):
-    """
-    Функция сверки градиентов: Ручной vs AutoDiff (JAX)
-    """
-    if not JAX_AVAILABLE:
-        return
+    if not JAX_AVAILABLE: return
 
     print("\n=== ПРОВЕРКА ГРАДИЕНТОВ (JAX vs ANALYTICAL) ===")
-    
     theta_test = TRUE_THETA + 0.1
-    print(f"Точка проверки theta: {theta_test}")
     
     # 1. Аналитический расчет
     J_manual, grad_manual = log_likelihood_and_gradient(theta_test, Y_obs)
     
-    # 2. Автоматический расчет через JAX
-    Y_jax = jnp.array(Y_obs)
-    U_jax = jnp.array(U_inputs)
-    
-    value_and_grad_fn = jax.value_and_grad(calculate_loss_jax)
-    J_auto, grad_auto = value_and_grad_fn(jnp.array(theta_test), Y_jax, U_jax)
-    
-    J_auto = float(J_auto)
-    grad_auto = np.array(grad_auto)
+    # 2. Автоматический расчет через JAX Wrapper (тестируем его же)
+    jax_obj_func = create_jax_optimization_wrapper(Y_obs, U_inputs)
+    J_auto, grad_auto = jax_obj_func(theta_test)
     
     print(f"{'Тип':<15} | {'J (Критерий)':<15} | {'Градиент dJ/dTheta'}")
     print("-" * 65)
@@ -310,12 +305,10 @@ def verify_gradients(Y_obs, U_inputs):
     print("-" * 65)
     
     diff_norm = np.linalg.norm(grad_manual - grad_auto)
-    print(f"Разница норм градиентов: {diff_norm:.2e}")
-    
     if diff_norm < 1e-6:
         print(">> РЕЗУЛЬТАТ: Аналитический градиент ВЕРЕН! ✅")
     else:
-        print(">> РЕЗУЛЬТАТ: Обнаружено расхождение! Проверьте формулы производных ❌")
+        print(f"xx РЕЗУЛЬТАТ: Расхождение {diff_norm:.2e} ❌")
     print("=" * 65 + "\n")
 
 # ======================================================================================
@@ -323,26 +316,39 @@ def verify_gradients(Y_obs, U_inputs):
 # ======================================================================================
 
 def main():
-    print("=== ЛАБОРАТОРНАЯ РАБОТА №1 + JAX CHECK ===")
+    print("=== ЛАБОРАТОРНАЯ РАБОТА №1 + JAX OPTIMIZATION ===")
     
     NUM_EXPERIMENTS = 5
     estimates = []
     y_true_all = []
     y_est_all = []
     
-    # Для проверки градиента генерируем один набор данных
     Y_temp, U_temp = generate_data(TRUE_THETA, N)
-    verify_gradients(Y_temp, U_temp) # <-- ВЫЗОВ ПРОВЕРКИ
+    verify_gradients(Y_temp, U_temp)
     
     theta_init = TRUE_THETA * 0.5 + 0.1
+    
+    # Режим работы
+    USING_JAX = JAX_AVAILABLE and USE_JAX_OPTIMIZER
+    method_name = "AutoDiff (JAX)" if USING_JAX else "Manual Analytical"
+    print(f"Метод оптимизации: {method_name}")
     print(f"{'№':<5} | {'Theta_1':<10} | {'Theta_2':<10} | {'Статус':<10}")
     
     for i in range(NUM_EXPERIMENTS):
-        Y_obs, _ = generate_data(TRUE_THETA, N)
+        Y_obs, U_inputs = generate_data(TRUE_THETA, N)
         y_true_all.append(Y_obs)
         
-        fun = lambda th: log_likelihood_and_gradient(th, Y_obs)
-        res = minimize(fun, theta_init, method='BFGS', jac=True, options={'disp': False})
+        # ВЫБОР ЦЕЛЕВОЙ ФУНКЦИИ
+        if USING_JAX:
+            # Создаем JIT-компилированную обертку для текущих данных Y и U
+            objective_function = create_jax_optimization_wrapper(Y_obs, U_inputs)
+        else:
+            # Используем ручную функцию (U_inputs берется внутри функции через get_input_signal, 
+            # что не идеально, но соответствует старой логике)
+            objective_function = lambda th: log_likelihood_and_gradient(th, Y_obs)
+        
+        # Оптимизация
+        res = minimize(objective_function, theta_init, method='BFGS', jac=True, options={'disp': False})
         
         theta_hat = res.x
         estimates.append(theta_hat)
@@ -365,10 +371,6 @@ def main():
     print(f"Error Theta: {delta_theta:.6f}")
     print(f"Error Y:     {delta_Y:.6f}")
     
-    if JAX_AVAILABLE:
-        print("\n(Примечание: Оптимизация выполнялась с использованием вашего АНАЛИТИЧЕСКОГО градиента,")
-        print("JAX использовался только для проверки его корректности в начале работы)")
-
     plt.figure(figsize=(10, 5))
     plt.plot(y_true_all[0].flatten(), 'b-o', label='Observation')
     plt.plot(y_est_all[0].flatten(), 'r--x', label='Model')
