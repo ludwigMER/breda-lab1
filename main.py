@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 # ======================================================================================
 # ПОДКЛЮЧЕНИЕ АВТОМАТИЧЕСКОГО ДИФФЕРЕНЦИРОВАНИЯ (JAX)
 # ======================================================================================
+
 try:
     import jax
     import jax.numpy as jnp
@@ -27,24 +28,21 @@ m = 1       # Размерность y
 r = 1       # Размерность u
 p = 2       # Размерность w
 
-TRUE_THETA = np.array([0.8, 0.5]) 
+TRUE_THETA = np.array([-4.6, 5]) 
+THETA1_BOUNDS = np.array([-10.0, -1.5])
+THETA2_BOUNDS = np.array([1.0, 8.0])
+U_BOUNDS = np.array([0.0, 7.0]) 
 USE_JAX_OPTIMIZER = True 
-
-def get_input_signal(k):
-    return np.array([1.0])
 
 # --- ГЛОБАЛЬНЫЕ КОНСТАНТНЫЕ МАТРИЦЫ ---
 CONST_GAMMA = np.eye(n)
 CONST_H     = np.array([[1.0, 0.0]])
 CONST_Q     = np.eye(p) * 0.1
-CONST_R     = np.eye(m) * 0.1
+CONST_R     = np.eye(m) * 0.4
 CONST_X0    = np.zeros(n)
 CONST_P0    = np.eye(n) * 1.0
 
-# ======================================================================================
-# УНИВЕРСАЛЬНЫЙ СТРОИТЕЛЬ МАТРИЦ
-# ======================================================================================
-
+# --- УНИВЕРСАЛЬНЫЙ СТРОИТЕЛЬ МАТРИЦ ---
 def build_parametric_matrices(theta, xp):
     """
     xp - это библиотека (numpy или jax.numpy).
@@ -52,19 +50,19 @@ def build_parametric_matrices(theta, xp):
     th1, th2 = theta[0], theta[1]
     
     F = xp.array([
-        [th1, 0.0], 
-        [0.0, 0.9]
+        [th1, 1.0], 
+        [-15, 0.0]
     ])
     
     Psi = xp.array([
         [th2], 
-        [1.0]
+        [0.0]
     ])
     
     return F, Psi
 
 # ======================================================================================
-# ФУНКЦИИ ФОРМИРОВАНИЯ НАБОРА
+# ФУНКЦИИ ФОРМИРОВАНИЯ ДАННЫХ
 # ======================================================================================
 
 def get_system_matrices(theta):
@@ -89,6 +87,25 @@ def get_matrix_derivatives(theta):
     dPsi[1][0, 0] = 1.0
     
     return dF, dPsi, dGamma, dH, dQ, dR, dx0, dP0
+
+def get_input_signal(k):
+    return np.array([3.0])
+
+def generate_data(theta_true, N_samples):
+    F, Psi, Gamma, H, Q, R, x0, P0 = get_system_matrices(theta_true)
+    x = np.random.multivariate_normal(x0, P0)
+    Y_obs = []; U_inputs = [] 
+    
+    for k in range(N_samples):
+        u = get_input_signal(k)
+        U_inputs.append(u)
+        w = np.random.multivariate_normal(np.zeros(p), Q)
+        v = np.random.multivariate_normal(np.zeros(m), R)
+        y = H @ x + v
+        Y_obs.append(y)
+        x = F @ x + Psi @ u + Gamma @ w
+        
+    return np.array(Y_obs), np.array(U_inputs)
 
 # ======================================================================================
 # ФУНКЦИИ ДЛЯ JAX (АВТО-ДИФФЕРЕНЦИРОВАНИЕ)
@@ -166,22 +183,6 @@ if JAX_AVAILABLE:
 # ======================================================================================
 # ОСНОВНЫЕ ФУНКЦИИ (РУЧНОЙ МЕТОД)
 # ======================================================================================
-
-def generate_data(theta_true, N_samples):
-    F, Psi, Gamma, H, Q, R, x0, P0 = get_system_matrices(theta_true)
-    x = np.random.multivariate_normal(x0, P0)
-    Y_obs = []; U_inputs = [] 
-    
-    for k in range(N_samples):
-        u = get_input_signal(k)
-        U_inputs.append(u)
-        w = np.random.multivariate_normal(np.zeros(p), Q)
-        v = np.random.multivariate_normal(np.zeros(m), R)
-        y = H @ x + v
-        Y_obs.append(y)
-        x = F @ x + Psi @ u + Gamma @ w
-        
-    return np.array(Y_obs), np.array(U_inputs)
 
 def log_likelihood_and_gradient(theta, Y_observations):
     """
@@ -308,7 +309,7 @@ def verify_gradients(Y_obs, U_inputs):
 # ======================================================================================
 
 def main():
-    
+    USE_JAX_OPTIMIZER = True if input("Использовать JAX? (Y/n): ") == "Y" else False
     NUM_EXPERIMENTS = 5
     estimates = []
     y_true_all = []
@@ -346,7 +347,8 @@ def main():
 
     theta_avg = np.mean(estimates, axis=0)
     print("-" * 70)
-    print(f"{'Sred':<5} | {theta_avg[0]:<10.4f} | {theta_avg[1]:<10.4f}")
+    print(f"{'True':<5} | {TRUE_THETA[0]:<10.4f} | {TRUE_THETA[1]:<10.4f}")
+    print(f"{'Avg':<5} | {theta_avg[0]:<10.4f} | {theta_avg[1]:<10.4f}")
     
     delta_theta = np.linalg.norm(TRUE_THETA - theta_avg) / np.linalg.norm(TRUE_THETA)
     
@@ -355,15 +357,15 @@ def main():
     delta_Y = np.linalg.norm(Y_obs_mean - Y_est_mean) / np.linalg.norm(Y_obs_mean)
     
     print("-" * 70)
-    print(f"Error Theta: {delta_theta:.6f}")
-    print(f"Error Y:     {delta_Y:.6f}")
+    print(f"Delta Theta: {delta_theta:.6f}")
+    print(f"Delta Y:     {delta_Y:.6f}")
     
-    '''
+    
     plt.figure(figsize=(10, 5))
     plt.plot(y_true_all[0].flatten(), 'b-o', label='Observation')
     plt.plot(y_est_all[0].flatten(), 'r--x', label='Model')
-    plt.legend(); plt.grid(True); plt.show()
-    '''
+    plt.legend(); plt.grid(True); plt.savefig('plot.png')
+
 
 if __name__ == "__main__":
     main()
