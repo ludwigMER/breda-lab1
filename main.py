@@ -26,21 +26,24 @@ N = 30      # Длина выборки
 n = 2       # Размерность x
 m = 1       # Размерность y
 r = 1       # Размерность u
-p = 2       # Размерность w
+p = 1       # Размерность w
 
 TRUE_THETA = np.array([-4.6, 5]) 
-THETA1_BOUNDS = np.array([-10.0, -1.5])
-THETA2_BOUNDS = np.array([1.0, 8.0])
-U_BOUNDS = np.array([0.0, 7.0]) 
+THETA1_BOUNDS = np.array([-10.0, -1.5]) # Границы для первого параметра
+THETA2_BOUNDS = np.array([1.0, 8.0])    # Границы для второго параметра
+# Cписок границ для minimize
+THETA_BOUNDS = [tuple(THETA1_BOUNDS), tuple(THETA2_BOUNDS)]
+
+U_BOUNDS = np.array([0.0, 7.0])
 USE_JAX_OPTIMIZER = True 
 
 # --- ГЛОБАЛЬНЫЕ КОНСТАНТНЫЕ МАТРИЦЫ ---
 CONST_GAMMA = np.eye(n)
 CONST_H     = np.array([[1.0, 0.0]])
-CONST_Q     = np.eye(p) * 0.1
+CONST_Q     = np.eye(p) * 0.3
 CONST_R     = np.eye(m) * 0.4
 CONST_X0    = np.zeros(n)
-CONST_P0    = np.eye(n) * 1.0
+CONST_P0    = np.eye(n) * 0.2
 
 # --- УНИВЕРСАЛЬНЫЙ СТРОИТЕЛЬ МАТРИЦ ---
 def build_parametric_matrices(theta, xp):
@@ -60,6 +63,53 @@ def build_parametric_matrices(theta, xp):
     ])
     
     return F, Psi
+
+# ======================================================================================
+# ПРОВЕРКА СВОЙСТВ СИСТЕМЫ
+# ======================================================================================
+
+def check_system_properties(theta):
+    """
+    Проверяет устойчивость, управляемость и наблюдаемость для заданных параметров.
+    """
+    print(f"\n--- Проверка свойств системы для theta={theta} ---")
+    F, Psi, _, H, _, _, _, _ = get_system_matrices(theta)
+    
+    # 1. Устойчивость (Собственные числа F по модулю < 1)
+    eig_vals = np.linalg.eigvals(F)
+    max_eig = np.max(np.abs(eig_vals))
+    is_stable = max_eig < 1.0
+    print(f"Собственные числа F: {eig_vals}")
+    print(f"Макс. модуль: {max_eig:.4f} -> {'УСТОЙЧИВА' if is_stable else 'НЕУСТОЙЧИВА'}")
+    
+    # 2. Управляемость: rank([Psi, F*Psi, ...]) = n
+    Controllability = Psi
+    temp_Psi = Psi
+    for _ in range(n - 1):
+        temp_Psi = F @ temp_Psi
+        Controllability = np.hstack((Controllability, temp_Psi))
+        
+    rank_C = np.linalg.matrix_rank(Controllability)
+    is_controllable = rank_C == n
+    print(f"Ранг матрицы управляемости: {rank_C}/{n} -> {'УПРАВЛЯЕМА' if is_controllable else 'НЕУПРАВЛЯЕМА'}")
+
+    # 3. Наблюдаемость: rank([H, H*F, ...]^T) = n
+    Observability = H
+    temp_H = H
+    for _ in range(n - 1):
+        temp_H = temp_H @ F
+        Observability = np.vstack((Observability, temp_H))
+        
+    rank_O = np.linalg.matrix_rank(Observability)
+    is_observable = rank_O == n
+    print(f"Ранг матрицы наблюдаемости: {rank_O}/{n} -> {'НАБЛЮДАЕМА' if is_observable else 'НЕНАБЛЮДАЕМА'}")
+    print("-" * 50 + "\n")
+
+    if not (is_controllable and is_observable):
+        print("ПРЕДУПРЕЖДЕНИЕ: Система вырождена. Идентификация может быть неточной.")
+
+    if not (is_stable):
+        print("ПРЕДУПРЕЖДЕНИЕ: Система неустойчива. Идентификация может дать неточный результат.")
 
 # ======================================================================================
 # ФУНКЦИИ ФОРМИРОВАНИЯ ДАННЫХ
@@ -124,7 +174,7 @@ if JAX_AVAILABLE:
         P0    = jnp.array(CONST_P0)
         return F, Psi, Gamma, H, Q, R, x0, P0
 
-    def calculate_loss_jax(theta, Y_observations_jax, U_inputs_jax):
+    def log_likelihood_and_gradient_jax(theta : np.ndarray, Y_obs : jax.Array, U_inputs : jax.Array):
         """
         Чистая функция расчета критерия J (без ручного градиента).
         JAX автоматически строит граф вычислений для этой функции.
@@ -138,8 +188,8 @@ if JAX_AVAILABLE:
         J += 0.5 * N * m * jnp.log(2 * jnp.pi)
         
         for k in range(N):
-            u = U_inputs_jax[k]
-            y_obs = Y_observations_jax[k]
+            u = U_inputs[k]
+            y_obs = Y_obs[k]
             
             if k > 0:
                  x_pred = F @ x_filt + Psi @ u
@@ -159,21 +209,21 @@ if JAX_AVAILABLE:
             
         return J
 
-    def create_jax_optimization_wrapper(Y_obs_numpy, U_inputs_numpy):
+    def create_jax_optimization_wrapper(Y_obs : np.ndarray, U_inputs : np.ndarray):
         """
         Создает функцию-обертку для scipy.minimize.
         1. Компилирует (JIT) функцию value_and_grad.
         2. Замораживает данные (Y и U) внутри замыкания.
         3. Конвертирует типы данных между Numpy (scipy) и JAX.
         """
-        Y_jax = jnp.array(Y_obs_numpy)
-        U_jax = jnp.array(U_inputs_numpy)
+        Y_jax = jnp.array(Y_obs)
+        U_jax = jnp.array(U_inputs)
 
-        jax_val_and_grad = jax.jit(jax.value_and_grad(calculate_loss_jax))
+        jax_val_and_grad = jax.jit(jax.value_and_grad(log_likelihood_and_gradient_jax))
         
-        def objective_function(theta_numpy):
+        def objective_function(theta : np.ndarray):
             # Вычисляем через JAX
-            val, grad = jax_val_and_grad(theta_numpy, Y_jax, U_jax)
+            val, grad = jax_val_and_grad(theta, Y_jax, U_jax)
             
             # Конвертируем обратно
             return float(val), np.array(grad)
@@ -184,7 +234,7 @@ if JAX_AVAILABLE:
 # ОСНОВНЫЕ ФУНКЦИИ (РУЧНОЙ МЕТОД)
 # ======================================================================================
 
-def log_likelihood_and_gradient(theta, Y_observations):
+def log_likelihood_and_gradient(theta, Y_obs : np.ndarray, U_inputs : np.ndarray):
     """
     РУЧНОЙ РАСЧЕТ: Критерий J и аналитический градиент dJ/dtheta.
     """
@@ -206,11 +256,9 @@ def log_likelihood_and_gradient(theta, Y_observations):
     grad_J = np.zeros(s)
     J += 0.5 * N * m * np.log(2 * np.pi)
     
-    U_inputs = [get_input_signal(k) for k in range(N)]
-    
     for k in range(N):
         u = U_inputs[k]
-        y_obs = Y_observations[k]
+        y_obs = Y_obs[k]
         
         if k > 0:
             x_pred = F @ x_filt + Psi @ u
@@ -275,7 +323,7 @@ def predict_output(theta, Y_obs):
         x_filt = x_pred + K @ (y_k - H @ x_pred)
         P_filt = (np.eye(n) - K @ H) @ P_pred
         Y_hat.append(H @ x_filt)
-        
+        7
     return np.array(Y_hat)
 
 def verify_gradients(Y_obs, U_inputs):
@@ -285,7 +333,7 @@ def verify_gradients(Y_obs, U_inputs):
     theta_test = TRUE_THETA + 0.1
     
     # 1. Аналитический расчет
-    J_manual, grad_manual = log_likelihood_and_gradient(theta_test, Y_obs)
+    J_manual, grad_manual = log_likelihood_and_gradient(theta_test, Y_obs, U_inputs)
     
     # 2. Автоматический расчет через JAX
     jax_obj_func = create_jax_optimization_wrapper(Y_obs, U_inputs)
@@ -309,6 +357,8 @@ def verify_gradients(Y_obs, U_inputs):
 # ======================================================================================
 
 def main():
+    check_system_properties(TRUE_THETA)
+
     USE_JAX_OPTIMIZER = True if input("Использовать JAX? (Y/n): ") == "Y" else False
     NUM_EXPERIMENTS = 5
     estimates = []
@@ -333,10 +383,10 @@ def main():
         if USING_JAX:
             objective_function = create_jax_optimization_wrapper(Y_obs, U_inputs)
         else:
-            objective_function = lambda th: log_likelihood_and_gradient(th, Y_obs)
+            objective_function = lambda th: log_likelihood_and_gradient(th, Y_obs, U_inputs)
         
         # Оптимизация
-        res = minimize(objective_function, theta_init, method='BFGS', jac=True, options={'disp': False})
+        res = minimize(objective_function, theta_init, method='L-BFGS-B', jac=True, bounds=THETA_BOUNDS)
         
         theta_hat = res.x
         estimates.append(theta_hat)
