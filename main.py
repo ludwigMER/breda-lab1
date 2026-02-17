@@ -38,7 +38,7 @@ U_BOUNDS = np.array([0.0, 7.0])
 USE_JAX_OPTIMIZER = True 
 
 # --- ГЛОБАЛЬНЫЕ КОНСТАНТНЫЕ МАТРИЦЫ ---
-CONST_GAMMA = np.eye(n)
+CONST_GAMMA = np.array([[1.0], [0.0]])
 CONST_H     = np.array([[1.0, 0.0]])
 CONST_Q     = np.eye(p) * 0.3
 CONST_R     = np.eye(m) * 0.4
@@ -54,7 +54,7 @@ def build_parametric_matrices(theta, xp):
     
     F = xp.array([
         [th1, 1.0], 
-        [-15, 0.0]
+        [-1.0, 0.0]
     ])
     
     Psi = xp.array([
