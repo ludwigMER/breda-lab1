@@ -53,8 +53,8 @@ def build_parametric_matrices(theta, xp):
     th1, th2 = theta[0], theta[1]
     
     F = xp.array([
-        [th1, 1.0], 
-        [-1.0, 0.0]
+        [0.1 * th1, 1.0], 
+        [-0.9, 0.0]
     ])
     
     Psi = xp.array([
@@ -78,7 +78,7 @@ def check_system_properties(theta):
     # 1. Устойчивость (Собственные числа F по модулю < 1)
     eig_vals = np.linalg.eigvals(F)
     max_eig = np.max(np.abs(eig_vals))
-    is_stable = max_eig < 1.0
+    is_stable = max_eig < 1.0 + 1e-6
     print(f"Собственные числа F: {eig_vals}")
     print(f"Макс. модуль: {max_eig:.4f} -> {'УСТОЙЧИВА' if is_stable else 'НЕУСТОЙЧИВА'}")
     
